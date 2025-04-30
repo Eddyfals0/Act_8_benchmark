@@ -3,13 +3,14 @@ import time
 from numba import cuda
 import math
 import warnings
+import gc
 from numba.cuda.cudadrv.devicearray import NumbaPerformanceWarning
 
 # Suprimir advertencias de Numba
 warnings.filterwarnings('ignore', category=NumbaPerformanceWarning)
 
 # Configuración para GPU
-BLOCK_SIZE = 16  # Tamaño de bloque para kernels CUDA (optimizado para GTX 960M)
+BLOCK_SIZE = 16  # Tamaño de bloque para kernels CUDA
 
 # Kernel CUDA para multiplicación de matrices estándar
 @cuda.jit
@@ -53,6 +54,11 @@ def matrix_mul_gpu_standard(A, B):
     
     # Copiar el resultado de vuelta a la CPU
     C = d_C.copy_to_host()
+    
+    # Liberar memoria GPU
+    del d_A
+    del d_B
+    del d_C
     
     return C, end_time - start_time
 
@@ -131,6 +137,11 @@ def strassen_gpu_optimized(A, B, threshold=512):
     # Transferir resultado de vuelta a CPU
     C = d_C.copy_to_host()
     
+    # Liberar memoria GPU
+    del d_A
+    del d_B
+    del d_C
+    
     return C
 
 # Función recursiva que mantiene datos en GPU
@@ -186,19 +197,49 @@ def _strassen_gpu_recursive(d_A, d_B, threshold):
     d_B21_B22 = add_matrices_gpu(d_B21, d_B22)
     
     # Calcular productos intermedios P1 a P7 secuencialmente
-    # Esta versión no usa ThreadPoolExecutor para evitar sobrecarga
     d_P1 = _strassen_gpu_recursive(d_A11_A22, d_B11_B22, threshold)
+    
+    # Liberar memoria que ya no se necesita
+    del d_A11_A22
+    del d_B11_B22
+    
     d_P2 = _strassen_gpu_recursive(d_A21_A22, d_B11, threshold)
+    
+    del d_A21_A22
+    
     d_P3 = _strassen_gpu_recursive(d_A11, d_B12_B22, threshold)
+    
+    del d_B12_B22
+    
     d_P4 = _strassen_gpu_recursive(d_A22, d_B21_B11, threshold)
+    
+    del d_B21_B11
+    
     d_P5 = _strassen_gpu_recursive(d_A11_A12, d_B22, threshold)
+    
+    del d_A11_A12
+    
     d_P6 = _strassen_gpu_recursive(d_A21_A11, d_B11_B12, threshold)
+    
+    del d_A21_A11
+    del d_B11_B12
+    
     d_P7 = _strassen_gpu_recursive(d_A12_A22, d_B21_B22, threshold)
+    
+    del d_A12_A22
+    del d_B21_B22
+    
+    # Limpiar referencias que ya no se necesitan
+    del d_A11, d_A12, d_A21, d_A22
+    del d_B11, d_B12, d_B21, d_B22
     
     # Calcular cuadrantes del resultado en GPU
     d_C11_temp1 = add_matrices_gpu(d_P1, d_P4)
     d_C11_temp2 = subtract_matrices_gpu(d_C11_temp1, d_P5)
     d_C11 = add_matrices_gpu(d_C11_temp2, d_P7)
+    
+    del d_C11_temp1
+    del d_C11_temp2
     
     d_C12 = add_matrices_gpu(d_P3, d_P5)
     
@@ -207,6 +248,12 @@ def _strassen_gpu_recursive(d_A, d_B, threshold):
     d_C22_temp1 = subtract_matrices_gpu(d_P1, d_P2)
     d_C22_temp2 = add_matrices_gpu(d_C22_temp1, d_P3)
     d_C22 = add_matrices_gpu(d_C22_temp2, d_P6)
+    
+    del d_C22_temp1
+    del d_C22_temp2
+    
+    # Liberar memoria de P1-P7 que ya no se necesita
+    del d_P1, d_P2, d_P3, d_P4, d_P5, d_P6, d_P7
     
     # Combinar cuadrantes en una sola matriz resultado
     d_C = cuda.device_array((n, n), np.float32)
@@ -217,24 +264,9 @@ def _strassen_gpu_recursive(d_A, d_B, threshold):
     d_C[half_n:, :half_n] = d_C21
     d_C[half_n:, half_n:] = d_C22
     
+    del d_C11, d_C12, d_C21, d_C22
+    
     return d_C
-
-# Función para dividir una matriz en cuatro submatrices
-def split_matrix(matrix):
-    """Divide una matriz en cuatro submatrices"""
-    n = matrix.shape[0] // 2
-    return matrix[:n, :n], matrix[:n, n:], matrix[n:, :n], matrix[n:, n:]
-
-# Función para combinar cuatro submatrices en una matriz grande
-def combine_matrices(C11, C12, C21, C22):
-    """Combina cuatro submatrices en una matriz grande"""
-    n = C11.shape[0]
-    C = np.zeros((2*n, 2*n), dtype=np.float32)
-    C[:n, :n] = C11
-    C[:n, n:] = C12
-    C[n:, :n] = C21
-    C[n:, n:] = C22
-    return C
 
 # Función para hacer padding a la matriz
 def pad_matrix(matrix):
@@ -253,91 +285,78 @@ def unpad_matrix(matrix, original_n, original_m):
     """Elimina el relleno de la matriz para volver a las dimensiones originales"""
     return matrix[:original_n, :original_m]
 
-# Función principal para ejecutar la comparación
-def main():
-    sizes = [64, 128, 256, 512, 1024, 2048]
+def verify_results(standard_result, strassen_result, tolerance=1e-4):
+    """Verifica que los resultados de ambos métodos sean similares"""
+    # Tomar una pequeña muestra para comparar (para matrices muy grandes)
+    max_sample = min(100, standard_result.shape[0])
+    sample_indices = np.random.choice(standard_result.shape[0], max_sample, replace=False)
     
-    print("\nComparación de algoritmos de multiplicación de matrices en GPU")
-    print("=" * 80)
-    print(f"{'Tamaño':^10} | {'GPU Estándar (s)':^15} | {'GPU Strassen Original (s)':^20} | {'GPU Strassen Optimizado (s)':^25} | {'Aceleración vs Estándar':^20}")
-    print("-" * 80)
+    sample_standard = standard_result[sample_indices, :][:, sample_indices]
+    sample_strassen = strassen_result[sample_indices, :][:, sample_indices]
+    
+    return np.allclose(sample_standard, sample_strassen, rtol=tolerance, atol=tolerance)
+
+def main():
+    # Tamaños de matrices grandes
+    sizes = [2048, 4096, 8192]
+    
+    print("\nComparación de algoritmos de multiplicación de matrices grandes en GPU")
+    print("=" * 85)
+    print(f"{'Tamaño':^10} | {'GPU Estándar (s)':^15} | {'GPU Strassen Optimizado (s)':^25} | {'Aceleración':^15} | {'Verificado':^10}")
+    print("-" * 85)
     
     for size in sizes:
-        # Crear matrices aleatorias
-        A = np.random.rand(size, size).astype(np.float32)
-        B = np.random.rand(size, size).astype(np.float32)
+        try:
+            print(f"Probando matrices de tamaño {size}x{size}...")
+            
+            # Crear matrices aleatorias
+            A = np.random.rand(size, size).astype(np.float32)
+            B = np.random.rand(size, size).astype(np.float32)
+            
+            # Medir tiempo para multiplicación estándar en GPU
+            standard_result, standard_time = matrix_mul_gpu_standard(A, B)
+            print(f"  - Multiplicación estándar completada: {standard_time:.6f} segundos")
+            
+            # Limpiar memoria
+            cuda.current_context().deallocations.clear()
+            gc.collect()
+            
+            # Preparar matrices para Strassen (padding a potencia de 2)
+            A_padded, original_n, original_m = pad_matrix(A)
+            B_padded, _, _ = pad_matrix(B)
+            
+            # Medir tiempo para el algoritmo de Strassen optimizado
+            cuda.synchronize()
+            start_time = time.perf_counter()
+            strassen_result_padded = strassen_gpu_optimized(A_padded, B_padded)
+            strassen_result = unpad_matrix(strassen_result_padded, size, size)
+            cuda.synchronize()
+            strassen_time = time.perf_counter() - start_time
+            print(f"  - Multiplicación Strassen completada: {strassen_time:.6f} segundos")
+            
+            # Limpiar memoria
+            del A_padded, B_padded, strassen_result_padded
+            cuda.current_context().deallocations.clear()
+            gc.collect()
+            
+            # Verificar resultados y calcular aceleración
+            verified = verify_results(standard_result, strassen_result)
+            speedup = standard_time / strassen_time if strassen_time > 0 else float('inf')
+            
+            print(f"{size:^10} | {standard_time:^15.6f} | {strassen_time:^25.6f} | {speedup:^15.3f} | {verified:^10}")
+            
+            # Liberar memoria
+            del A, B, standard_result, strassen_result
+            gc.collect()
+            
+        except cuda.CudaAPIError as e:
+            print(f"Error de CUDA para tamaño {size}: {e}")
+        except MemoryError:
+            print(f"Error de memoria para tamaño {size}. Saltando al siguiente tamaño.")
         
-        # Calcular resultado de referencia con NumPy
-        numpy_result = np.matmul(A, B)
-        
-        # Medir tiempo para multiplicación estándar en GPU
-        _, standard_time = matrix_mul_gpu_standard(A, B)
-        
-        # Preparar matrices para Strassen (padding a potencia de 2)
-        A_padded, original_n, original_m = pad_matrix(A)
-        B_padded, _, _ = pad_matrix(B)
-        
-        # Medir tiempo para el algoritmo de Strassen original
-        cuda.synchronize()
-        start_time = time.perf_counter()
-        strassen_result_old = strassen_gpu(A_padded, B_padded)
-        strassen_result_old = unpad_matrix(strassen_result_old, size, size)
-        cuda.synchronize()
-        strassen_old_time = time.perf_counter() - start_time
-        
-        # Medir tiempo para el algoritmo de Strassen optimizado
-        cuda.synchronize()
-        start_time = time.perf_counter()
-        strassen_result_new = strassen_gpu_optimized(A_padded, B_padded)
-        strassen_result_new = unpad_matrix(strassen_result_new, size, size)
-        cuda.synchronize()
-        strassen_new_time = time.perf_counter() - start_time
-        
-        # Verificar precisión de resultados
-        strassen_old_accurate = np.allclose(strassen_result_old, numpy_result, rtol=1e-4, atol=1e-4)
-        strassen_new_accurate = np.allclose(strassen_result_new, numpy_result, rtol=1e-4, atol=1e-4)
-        
-        # Calcular aceleraciones
-        speedup_old = round(standard_time / strassen_old_time, 3) if strassen_old_time > 0 else 'N/A'
-        speedup_new = round(standard_time / strassen_new_time, 3) if strassen_new_time > 0 else 'N/A'
-        
-        # Imprimir resultados
-        print(f"{size:^10} | {standard_time:^15.6f} | {strassen_old_time:^20.6f} | {strassen_new_time:^25.6f} | {speedup_new:^20}")
-
-# Mantener la implementación original para comparación
-def strassen_gpu(A, B, threshold=64):
-    """Algoritmo de Strassen en GPU con umbral para cambiar a multiplicación estándar"""
-    A = np.ascontiguousarray(A)  # Asegurar que A sea contigua
-    B = np.ascontiguousarray(B)  # Asegurar que B sea contigua
-    
-    n = A.shape[0]
-
-    # Si la matriz es lo suficientemente pequeña, usar el método estándar en GPU
-    if n <= threshold:
-        result, _ = matrix_mul_gpu_standard(A, B)
-        return result
-    
-    # Dividir matrices en cuadrantes
-    A11, A12, A21, A22 = split_matrix(A)
-    B11, B12, B21, B22 = split_matrix(B)
-
-    # Calcular productos intermedios P1 a P7 en paralelo usando CUDA
-    P1 = strassen_gpu(A11 + A22, B11 + B22, threshold)
-    P2 = strassen_gpu(A21 + A22, B11, threshold)
-    P3 = strassen_gpu(A11, B12 - B22, threshold)
-    P4 = strassen_gpu(A22, B21 - B11, threshold)
-    P5 = strassen_gpu(A11 + A12, B22, threshold)
-    P6 = strassen_gpu(A21 - A11, B11 + B12, threshold)
-    P7 = strassen_gpu(A12 - A22, B21 + B22, threshold)
-
-    # Calcular cuadrantes del resultado
-    C11 = P1 + P4 - P5 + P7
-    C12 = P3 + P5
-    C21 = P2 + P4
-    C22 = P1 - P2 + P3 + P6
-    
-    # Combinar cuadrantes y devolver el resultado
-    return combine_matrices(C11, C12, C21, C22)
+        # Forzar limpieza de memoria
+        cuda.current_context().deallocations.clear()
+        gc.collect()
 
 if __name__ == "__main__":
-    main()
+    main() 

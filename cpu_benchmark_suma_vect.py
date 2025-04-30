@@ -2,21 +2,25 @@
 import multiprocessing  # Para manejo de múltiples procesos
 import numpy as np      # Para operaciones numéricas eficientes
 import time            # Para medir el tiempo de ejecución
+import ctypes          # Para tipos de datos compatibles con C
 
 # Tamaño de los vectores a sumar
-size = 100_000
+size = 100_000_000
 
-def add_chunk(start, end, a, b, result):
+def add_chunk(start, end, shared_a, shared_b, shared_result):
     """
     Suma una porción (chunk) de dos vectores y almacena el resultado.
     
     Args:
         start: Índice inicial del chunk
         end: Índice final del chunk
-        a, b: Vectores a sumar
-        result: Array donde se almacenará el resultado
+        shared_a: Vector A compartido
+        shared_b: Vector B compartido
+        shared_result: Vector resultado compartido
     """
-    result[start:end] = a[start:end] + b[start:end]
+    # Realizamos la suma
+    for i in range(start, end):
+        shared_result[i] = shared_a[i] + shared_b[i]
 
 def benchmark_cpu():
     """
@@ -24,11 +28,19 @@ def benchmark_cpu():
     Crea dos vectores aleatorios, los suma en paralelo y mide el tiempo de ejecución.
     """
     # Creación de vectores aleatorios
-    a = np.random.rand(size).astype(np.float32)
-    b = np.random.rand(size).astype(np.float32)
+    a_np = np.random.rand(size).astype(np.float32)
+    b_np = np.random.rand(size).astype(np.float32)
     
-    # Array compartido para almacenar resultados
-    result = multiprocessing.Array('f', size)
+    # Creamos arrays compartidos
+    shared_a = multiprocessing.RawArray(ctypes.c_float, size)
+    shared_b = multiprocessing.RawArray(ctypes.c_float, size)
+    shared_result = multiprocessing.RawArray(ctypes.c_float, size)
+    
+    # Copiamos los datos a los arrays compartidos
+    a_temp = np.frombuffer(shared_a, dtype=np.float32)
+    b_temp = np.frombuffer(shared_b, dtype=np.float32)
+    a_temp[:] = a_np[:]
+    b_temp[:] = b_np[:]
 
     # Determinación del número de procesos según los cores disponibles
     num_processes = multiprocessing.cpu_count()
@@ -42,7 +54,10 @@ def benchmark_cpu():
     for i in range(num_processes):
         start_idx = i * chunk_size
         end_idx = size if i == num_processes - 1 else (i + 1) * chunk_size
-        p = multiprocessing.Process(target=add_chunk, args=(start_idx, end_idx, a, b, result))
+        p = multiprocessing.Process(
+            target=add_chunk, 
+            args=(start_idx, end_idx, shared_a, shared_b, shared_result)
+        )
         processes.append(p)
         p.start()
 
@@ -57,4 +72,6 @@ def benchmark_cpu():
     print(f"[CPU] Tiempo de ejecución con {num_processes} cores: {end_time - start_time:.4f} segundos")
 
 if __name__ == "__main__":
+    # Necesario para Windows
+    multiprocessing.freeze_support()
     benchmark_cpu()
